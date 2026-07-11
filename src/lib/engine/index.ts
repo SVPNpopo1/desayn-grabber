@@ -165,7 +165,7 @@ function detectBackground(
   bgG /= samples.length;
   bgB /= samples.length;
 
-  // Threshold: 1 = design (foreground), 0 = background
+  // Threshold: 1 = background, 0 = foreground (design)
   const mask = new Uint8Array(w * h);
   for (let i = 0; i < w * h; i++) {
     const idx = i * 4;
@@ -173,7 +173,7 @@ function detectBackground(
     const dg = data[idx + 1] - bgG;
     const db = data[idx + 2] - bgB;
     const dist = Math.sqrt(dr * dr + dg * dg + db * db);
-    mask[i] = dist > tolerance ? 1 : 0;
+    mask[i] = dist > tolerance ? 0 : 1;
   }
 
   return mask;
@@ -184,13 +184,13 @@ function borderBgFraction(mask: Uint8Array, w: number, h: number): number {
   let total = 0;
   let bg = 0;
   for (let x = 0; x < w; x++) {
-    if (!mask[x]) bg++;           // top row
-    if (!mask[(h - 1) * w + x]) bg++; // bottom row
+    if (mask[x]) bg++;           // top row
+    if (mask[(h - 1) * w + x]) bg++; // bottom row
     total += 2;
   }
   for (let y = 0; y < h; y++) {
-    if (!mask[y * w]) bg++;       // left col
-    if (!mask[y * w + w - 1]) bg++; // right col
+    if (mask[y * w]) bg++;       // left col
+    if (mask[y * w + w - 1]) bg++; // right col
     total += 2;
   }
   return bg / total;
@@ -206,42 +206,14 @@ function edgeBasedAlpha(
   const alpha = new Uint8Array(w * h);
 
   if (bgMask) {
-    // Dilate the bg mask to soften edges
-    const dilated = new Uint8Array(w * h);
-    const r = 3;
-    for (let y = 0; y < h; y++) {
-      for (let x = 0; x < w; x++) {
-        if (bgMask[y * w + x]) {
-          // Mark this pixel and neighbors as bg
-          for (let dy = -r; dy <= r; dy++) {
-            for (let dx = -r; dx <= r; dx++) {
-              const nx = x + dx;
-              const ny = y + dy;
-              if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
-                const dist = Math.sqrt(dx * dx + dy * dy);
-                const fade = Math.max(0, 1 - dist / r);
-                const idx = ny * w + nx;
-                // Fade alpha at edges of bg
-                const existing = alpha[idx];
-                const newVal = Math.round(255 * fade);
-                alpha[idx] = Math.max(existing, newVal > 200 ? 0 : 255);
-              }
-            }
-          }
-        }
-      }
-    }
-
-    // Directly set: bg pixels = 0, non-bg = 255
+    // bgMask: 1=background, 0=design(foreground)
+    // Set alpha: 255=opaque(design), 0=transparent(bg)
     for (let i = 0; i < w * h; i++) {
       alpha[i] = bgMask[i] ? 0 : 255;
     }
 
-    // Smooth the alpha edge
-    const smoothed = gaussianBlur(
-      new Float32Array(alpha),
-      w, h, 2
-    );
+    // Smooth the alpha edge for softer transitions
+    const smoothed = gaussianBlur(new Float32Array(alpha), w, h, 2);
     for (let i = 0; i < w * h; i++) {
       const v = smoothed[i];
       if (bgMask[i]) {
@@ -251,7 +223,6 @@ function edgeBasedAlpha(
       }
     }
   } else {
-    // No background detected — all opaque
     alpha.fill(255);
   }
 

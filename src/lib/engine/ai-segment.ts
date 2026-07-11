@@ -1,52 +1,87 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
-const VISION_BUNDLE_URL =
-  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/vision_bundle.mjs";
+/**
+ * AI segmentation module.
+ *
+ * Uses MediaPipe selfie_segmenter loaded from CDN at runtime.
+ * Falls back gracefully to null (triggering CV fallback in the pipeline).
+ */
+
 const WASM_CDN = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm";
 const MODEL_URL =
   "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite";
 
-interface Segmenter {
-  segment(image: ImageData): { confidenceMasks?: { getAsFloat32Array(): Float32Array; close(): void }[]; close(): void };
-  close(): void;
+let loaderPromise: Promise<any> | null = null;
+let segmenterPromise: Promise<any> | null = null;
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new Error(`Timed out after ${ms}ms`)), ms)
+    ),
+  ]);
 }
 
-let segmenterPromise: Promise<Segmenter> | null = null;
+async function loadVisionTasks(): Promise<any> {
+  if (loaderPromise) return loaderPromise;
 
-async function loadVisionModule(): Promise<any> {
-  // Use Function constructor to bypass Turbopack/Next.js static analysis
-  const dynamicImport = new Function("url", "return import(url)") as (url: string) => Promise<any>;
-  return dynamicImport(VISION_BUNDLE_URL);
-}
+  loaderPromise = (async () => {
+    // Load MediaPipe vision bundle into a global via dynamic script injection
+    // The bundle registers itself on window when loaded as a classic script
+    const bundleUrl =
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/vision_bundle.js";
 
-async function getSegmenter(): Promise<Segmenter> {
-  if (!segmenterPromise) {
-    segmenterPromise = (async () => {
-      const vision = await loadVisionModule();
-      const filesetResolver = await vision.FilesetResolver.forVisionTasks(WASM_CDN);
-      return vision.ImageSegmenter.createFromOptions(filesetResolver, {
-        baseOptions: { modelAssetPath: MODEL_URL, delegate: "GPU" },
-        runningMode: "IMAGE",
-        outputConfidenceMasks: true,
-        outputCategoryMask: false,
-      });
-    })();
-  }
-  return segmenterPromise;
+    await new Promise<void>((resolve, reject) => {
+      const existing = document.getElementById("mp-vision-bundle");
+      if (existing) { resolve(); return; }
+      const s = document.createElement("script");
+      s.id = "mp-vision-bundle";
+      s.src = bundleUrl;
+      s.crossOrigin = "anonymous";
+      s.onload = () => resolve();
+      s.onerror = () => reject(new Error("Failed to load MediaPipe vision bundle"));
+      document.head.appendChild(s);
+    });
+
+    // The UMD bundle exposes everything under the global scope
+    // Try common global names
+    const w = window as any;
+    const vision = w.vision || w.Vision || w.mediapipe || w;
+    if (!vision?.ImageSegmenter) {
+      throw new Error("MediaPipe ImageSegmenter not found on window");
+    }
+    return vision;
+  })();
+
+  return loaderPromise;
 }
 
 /**
  * AI segmentation using MediaPipe selfie_segmenter.
  * Returns Uint8Array mask: 1 = foreground (person/garment), 0 = background.
- * Falls back to returning null if the model can't load.
+ * Returns null on any failure (model load, timeout, segmentation error).
  */
 export async function aiSegmentForeground(
   imageData: ImageData
 ): Promise<Uint8Array | null> {
-  let segmenter: Segmenter;
+  let segmenter: any;
+
   try {
-    segmenter = await getSegmenter();
+    if (!segmenterPromise) {
+      segmenterPromise = (async () => {
+        const vision = await loadVisionTasks();
+        const filesetResolver = await vision.FilesetResolver.forVisionTasks(WASM_CDN);
+        return vision.ImageSegmenter.createFromOptions(filesetResolver, {
+          baseOptions: { modelAssetPath: MODEL_URL, delegate: "GPU" },
+          runningMode: "IMAGE",
+          outputConfidenceMasks: true,
+          outputCategoryMask: false,
+        });
+      })();
+    }
+    segmenter = await withTimeout(segmenterPromise, 8000);
   } catch (err) {
-    console.warn("[ai-segment] Failed to load MediaPipe, falling back to CV:", err);
+    console.warn("[ai-segment] MediaPipe init failed, falling back to CV:", err);
+    loaderPromise = null;
     segmenterPromise = null;
     return null;
   }

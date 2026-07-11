@@ -17,7 +17,9 @@ import {
 import {
   imageBufferToDataURL,
 } from "./render";
-import { aiSegmentForeground, imageToImageData } from "./ai-segment";
+// AI segmentation disabled — CDN loading blocks pipeline.
+// Re-enable once MediaPipe bundle loading is verified.
+// import { aiSegmentForeground, imageToImageData } from "./ai-segment";
 
 const MAX_DIM = 1200;
 
@@ -261,32 +263,15 @@ export async function extractDesign(
 
   // 3. Detect garment
   let garmentMask: Uint8Array;
-  await runStep("Detecting garment", async () => {
-    let usedAI = false;
-
-    // Try AI segmentation first
-    try {
-      // Create ImageData from current pixel data
-      const imgData = new ImageData(new Uint8ClampedArray(data), w, h);
-      const aiMask = await aiSegmentForeground(imgData);
-      if (aiMask) {
-        garmentMask = aiMask;
-        usedAI = true;
-      }
-    } catch {
-      // AI failed, fall through to CV
-    }
-
-    if (!usedAI) {
-      const result = detectGarment(data, w, h);
-      garmentMask = result.garmentMask;
-    }
+  await runStep("Detecting garment", () => {
+    const result = detectGarment(data, w, h);
+    garmentMask = result.garmentMask;
 
     // Count garment vs bg
     let garmentPx = 0;
     for (let i = 0; i < w * h; i++) if (garmentMask[i]) garmentPx++;
     const garmentFrac = garmentPx / (w * h);
-    steps[steps.length - 1].details = `${usedAI ? "AI" : "CV"} — Garment: ${(garmentFrac * 100).toFixed(0)}% of image`;
+    steps[steps.length - 1].details = `Garment: ${(garmentFrac * 100).toFixed(0)}% of image`;
 
     // If garment < 10% or > 95%, the detection probably failed
     if (garmentFrac < 0.1 || garmentFrac > 0.95) {

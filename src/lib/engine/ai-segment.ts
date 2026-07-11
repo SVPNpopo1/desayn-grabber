@@ -1,18 +1,29 @@
-import type { ImageSegmenter, ImageSegmenterResult } from "@mediapipe/tasks-vision";
-
-const WASM_CDN = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm";
+/* eslint-disable @typescript-eslint/no-explicit-any */
+const VISION_BUNDLE_URL =
+  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/vision_bundle.mjs";
+const WASM_CDN = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm";
 const MODEL_URL =
   "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite";
 
-let segmenterPromise: Promise<ImageSegmenter> | null = null;
+interface Segmenter {
+  segment(image: ImageData): { confidenceMasks?: { getAsFloat32Array(): Float32Array; close(): void }[]; close(): void };
+  close(): void;
+}
 
-async function getSegmenter(): Promise<ImageSegmenter> {
+let segmenterPromise: Promise<Segmenter> | null = null;
+
+async function loadVisionModule(): Promise<any> {
+  // Use Function constructor to bypass Turbopack/Next.js static analysis
+  const dynamicImport = new Function("url", "return import(url)") as (url: string) => Promise<any>;
+  return dynamicImport(VISION_BUNDLE_URL);
+}
+
+async function getSegmenter(): Promise<Segmenter> {
   if (!segmenterPromise) {
     segmenterPromise = (async () => {
-      const vision = await import("@mediapipe/tasks-vision");
-      const { ImageSegmenter: IS, FilesetResolver } = vision;
-      const filesetResolver = await FilesetResolver.forVisionTasks(WASM_CDN);
-      return IS.createFromOptions(filesetResolver, {
+      const vision = await loadVisionModule();
+      const filesetResolver = await vision.FilesetResolver.forVisionTasks(WASM_CDN);
+      return vision.ImageSegmenter.createFromOptions(filesetResolver, {
         baseOptions: { modelAssetPath: MODEL_URL, delegate: "GPU" },
         runningMode: "IMAGE",
         outputConfidenceMasks: true,
@@ -31,16 +42,17 @@ async function getSegmenter(): Promise<ImageSegmenter> {
 export async function aiSegmentForeground(
   imageData: ImageData
 ): Promise<Uint8Array | null> {
-  let segmenter: ImageSegmenter;
+  let segmenter: Segmenter;
   try {
     segmenter = await getSegmenter();
   } catch (err) {
-    console.warn("[ai-segment] Failed to load MediaPipe segmenter, falling back to CV:", err);
+    console.warn("[ai-segment] Failed to load MediaPipe, falling back to CV:", err);
+    segmenterPromise = null;
     return null;
   }
 
   try {
-    const result: ImageSegmenterResult = segmenter.segment(imageData);
+    const result = segmenter.segment(imageData);
     const confMask = result.confidenceMasks?.[0];
     if (!confMask) {
       result.close();
@@ -50,8 +62,6 @@ export async function aiSegmentForeground(
     const raw = confMask.getAsFloat32Array();
     const mask = new Uint8Array(imageData.width * imageData.height);
 
-    // MediaPipe selfie_segmenter: 0 = background, >0 = person (foreground).
-    // Threshold at 0.5 for clean binary mask.
     for (let i = 0; i < mask.length; i++) {
       mask[i] = raw[i] > 0.5 ? 1 : 0;
     }
@@ -65,9 +75,6 @@ export async function aiSegmentForeground(
   }
 }
 
-/**
- * Convert HTMLImageElement to ImageData for MediaPipe.
- */
 export function imageToImageData(img: HTMLImageElement): ImageData {
   const canvas = document.createElement("canvas");
   canvas.width = img.naturalWidth;

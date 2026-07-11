@@ -6,17 +6,8 @@ import type {
 } from "./types";
 import { gaussianBlur } from "./preprocess";
 import {
-  floodFillBackground,
-  findDesignBoundingBox,
-  dilateMask,
-  erodeMask,
-} from "./detect";
-import {
-  harrisCorners,
-  fitQuadrilateral,
-  cornersFromBoundingBox,
-} from "./edges";
-import { warpPerspective } from "./homography";
+  warpPerspective,
+} from "./homography";
 import { removeWrinkles, removeLightingGradient } from "./wrinkles";
 import {
   autoWhiteBalance,
@@ -24,9 +15,6 @@ import {
   normalizeSaturation,
 } from "./color";
 import {
-  autoCrop,
-  generateAlphaMask,
-  flattenToWhiteBackground,
   imageBufferToDataURL,
 } from "./render";
 
@@ -71,181 +59,166 @@ function clampByte(v: number): number {
   return v < 0 ? 0 : v > 255 ? 255 : Math.round(v);
 }
 
-/** Proper per-channel Gaussian blur — preserves color */
-function denoiseRGBA(
+// ============================================================
+// Step 2: Detect garment — flood fill from edges to find
+// non-garment (background). The garment is the inverse.
+// ============================================================
+function detectGarment(
   data: Uint8ClampedArray,
   w: number,
-  h: number,
-  radius: number
-): Uint8ClampedArray {
-  const out = new Uint8ClampedArray(data);
-
-  // Build 1D kernel
-  const kernel: number[] = [];
-  let sum = 0;
-  for (let i = -radius; i <= radius; i++) {
-    const v = Math.exp(-(i * i) / (2 * radius * radius));
-    kernel.push(v);
-    sum += v;
-  }
-  for (let i = 0; i < kernel.length; i++) kernel[i] /= sum;
-
-  // Temp buffer for horizontal pass
-  const temp = new Float32Array(w * h * 4);
-
-  // Horizontal pass
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      let r = 0, g = 0, b = 0;
-      for (let k = -radius; k <= radius; k++) {
-        const sx = Math.min(Math.max(x + k, 0), w - 1);
-        const idx = (y * w + sx) * 4;
-        const weight = kernel[k + radius];
-        r += data[idx] * weight;
-        g += data[idx + 1] * weight;
-        b += data[idx + 2] * weight;
-      }
-      const oi = (y * w + x) * 4;
-      temp[oi] = r;
-      temp[oi + 1] = g;
-      temp[oi + 2] = b;
-    }
-  }
-
-  // Vertical pass
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      let r = 0, g = 0, b = 0;
-      for (let k = -radius; k <= radius; k++) {
-        const sy = Math.min(Math.max(y + k, 0), h - 1);
-        const idx = (sy * w + x) * 4;
-        const weight = kernel[k + radius];
-        r += temp[idx] * weight;
-        g += temp[idx + 1] * weight;
-        b += temp[idx + 2] * weight;
-      }
-      const oi = (y * w + x) * 4;
-      out[oi] = clampByte(r);
-      out[oi + 1] = clampByte(g);
-      out[oi + 2] = clampByte(b);
-      out[oi + 3] = data[oi + 3]; // preserve alpha
-    }
-  }
-
-  return out;
-}
-
-/** Detect background by sampling border pixels, return thresholded mask */
-function detectBackground(
-  data: Uint8ClampedArray,
-  w: number,
-  h: number,
-  tolerance: number = 45
-): Uint8Array {
-  // Sample background color from border (2px ring)
-  const samples: [number, number, number][] = [];
+  h: number
+): { garmentMask: Uint8Array; bgAvg: [number, number, number] } {
+  // Sample edge pixels (2px border) to estimate background color
+  const edgePixels: [number, number, number][] = [];
   for (let x = 0; x < w; x += 2) {
     for (const y of [0, 1, h - 2, h - 1]) {
       const i = (y * w + x) * 4;
-      samples.push([data[i], data[i + 1], data[i + 2]]);
+      edgePixels.push([data[i], data[i + 1], data[i + 2]]);
     }
   }
   for (let y = 0; y < h; y += 2) {
     for (const x of [0, 1, w - 2, w - 1]) {
       const i = (y * w + x) * 4;
-      samples.push([data[i], data[i + 1], data[i + 2]]);
+      edgePixels.push([data[i], data[i + 1], data[i + 2]]);
     }
   }
 
-  // K-means-lite: find dominant color cluster
-  // Simple approach: average all border samples
   let bgR = 0, bgG = 0, bgB = 0;
-  for (const s of samples) { bgR += s[0]; bgG += s[1]; bgB += s[2]; }
-  bgR /= samples.length;
-  bgG /= samples.length;
-  bgB /= samples.length;
+  for (const p of edgePixels) { bgR += p[0]; bgG += p[1]; bgB += p[2]; }
+  bgR /= edgePixels.length;
+  bgG /= edgePixels.length;
+  bgB /= edgePixels.length;
 
-  // Threshold: 1 = background, 0 = foreground (design)
-  const mask = new Uint8Array(w * h);
-  for (let i = 0; i < w * h; i++) {
-    const idx = i * 4;
-    const dr = data[idx] - bgR;
-    const dg = data[idx + 1] - bgG;
-    const db = data[idx + 2] - bgB;
-    const dist = Math.sqrt(dr * dr + dg * dg + db * db);
-    mask[i] = dist > tolerance ? 0 : 1;
-  }
+  const tolerance = 50;
+  const visited = new Uint8Array(w * h);
+  const bgMask = new Uint8Array(w * h); // 1 = background
 
-  return mask;
-}
-
-/** Check what fraction of border pixels are "background" — if too little, no clear bg */
-function borderBgFraction(mask: Uint8Array, w: number, h: number): number {
-  let total = 0;
-  let bg = 0;
+  // BFS flood fill from all edge pixels
+  const queue: number[] = [];
   for (let x = 0; x < w; x++) {
-    if (mask[x]) bg++;           // top row
-    if (mask[(h - 1) * w + x]) bg++; // bottom row
-    total += 2;
+    queue.push(x);               // top row
+    queue.push((h - 1) * w + x); // bottom row
   }
   for (let y = 0; y < h; y++) {
-    if (mask[y * w]) bg++;       // left col
-    if (mask[y * w + w - 1]) bg++; // right col
-    total += 2;
+    queue.push(y * w);         // left col
+    queue.push(y * w + w - 1); // right col
   }
-  return bg / total;
+
+  while (queue.length > 0) {
+    const idx = queue.pop()!;
+    if (visited[idx]) continue;
+    visited[idx] = 1;
+
+    const px = idx * 4;
+    const dr = data[px] - bgR;
+    const dg = data[px + 1] - bgG;
+    const db = data[px + 2] - bgB;
+    const dist = Math.sqrt(dr * dr + dg * dg + db * db);
+
+    if (dist > tolerance * 2) continue; // Too different from bg — stop
+
+    bgMask[idx] = 1; // Mark as background
+
+    const x = idx % w;
+    const y = (idx - x) / w;
+
+    if (x > 0 && !visited[(y) * w + (x - 1)]) queue.push((y) * w + (x - 1));
+    if (x < w - 1 && !visited[(y) * w + (x + 1)]) queue.push((y) * w + (x + 1));
+    if (y > 0 && !visited[(y - 1) * w + x]) queue.push((y - 1) * w + x);
+    if (y < h - 1 && !visited[(y + 1) * w + x]) queue.push((y + 1) * w + x);
+  }
+
+  // Garment = NOT background
+  const garmentMask = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) garmentMask[i] = bgMask[i] ? 0 : 1;
+
+  return { garmentMask, bgAvg: [bgR, bgG, bgB] };
 }
 
-/** Generate alpha mask based on edge saliency, not color threshold */
-function edgeBasedAlpha(
-  data: Uint8ClampedArray,
+// ============================================================
+// Step 3: Find garment bounding box and corners
+// ============================================================
+function findGarmentBounds(mask: Uint8Array, w: number, h: number): {
+  bbox: { x: number; y: number; w: number; h: number };
+  quad: Quad;
+} | null {
+  let minX = w, maxX = 0, minY = h, maxY = 0;
+  let found = false;
+
+  for (let y = 0; y < h; y += 2) {
+    for (let x = 0; x < w; x += 2) {
+      if (mask[y * w + x]) {
+        found = true;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+
+  if (!found) return null;
+
+  const pad = 2;
+  minX = Math.max(0, minX - pad);
+  minY = Math.max(0, minY - pad);
+  maxX = Math.min(w - 1, maxX + pad);
+  maxY = Math.min(h - 1, maxY + pad);
+
+  const bbox = { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 };
+
+  const quad: Quad = {
+    topLeft: { x: minX, y: minY },
+    topRight: { x: maxX, y: minY },
+    bottomRight: { x: maxX, y: maxY },
+    bottomLeft: { x: minX, y: maxY },
+  };
+
+  return { bbox, quad };
+}
+
+// ============================================================
+// Step 4: Create alpha from garment mask (feathered edges)
+// ============================================================
+function garmentToAlpha(
+  garmentMask: Uint8Array,
   w: number,
-  h: number,
-  bgMask: Uint8Array | null
+  h: number
 ): Uint8Array {
   const alpha = new Uint8Array(w * h);
 
-  if (bgMask) {
-    // bgMask: 1=background, 0=design(foreground)
-    // Set alpha: 255=opaque(design), 0=transparent(bg)
-    for (let i = 0; i < w * h; i++) {
-      alpha[i] = bgMask[i] ? 0 : 255;
-    }
+  // Binary mask first
+  for (let i = 0; i < w * h; i++) {
+    alpha[i] = garmentMask[i] ? 255 : 0;
+  }
 
-    // Smooth the alpha edge for softer transitions
-    const smoothed = gaussianBlur(new Float32Array(alpha), w, h, 2);
-    for (let i = 0; i < w * h; i++) {
-      const v = smoothed[i];
-      if (bgMask[i]) {
-        alpha[i] = v < 128 ? 0 : 255;
-      } else {
-        alpha[i] = v > 128 ? 255 : 0;
-      }
-    }
-  } else {
-    alpha.fill(255);
+  // Feather edges with Gaussian blur
+  const blurred = gaussianBlur(new Float32Array(alpha), w, h, 3);
+  for (let i = 0; i < w * h; i++) {
+    alpha[i] = garmentMask[i]
+      ? (blurred[i] > 200 ? 255 : blurred[i] > 50 ? Math.round(blurred[i]) : 0)
+      : (blurred[i] < 50 ? 0 : Math.round(Math.min(blurred[i], 50)));
   }
 
   return alpha;
 }
 
+// ============================================================
+// Main extraction pipeline
+// ============================================================
 export async function extractDesign(
   imageSrc: string,
   options?: Partial<PipelineOptions>,
   onProgress?: (step: string, progress: number) => void
 ): Promise<PipelineResult> {
   const opts: PipelineOptions = {
-    maxColors: options?.maxColors ?? 24,
-    edgeStrength: options?.edgeStrength ?? 0.5,
-    wrinkleRemoval: options?.wrinkleRemoval ?? 0.5,
+    wrinkleRemoval: options?.wrinkleRemoval ?? 0.4,
     perspectiveCorrection: options?.perspectiveCorrection ?? true,
     backgroundRemoval: options?.backgroundRemoval ?? true,
     colorCorrection: options?.colorCorrection ?? true,
     denoise: options?.denoise ?? true,
     outputFormat: options?.outputFormat ?? "png",
     outputQuality: options?.outputQuality ?? 0.95,
-    outputWidth: options?.outputWidth ?? 2000,
-    outputHeight: options?.outputHeight ?? 2000,
   };
 
   const steps: PipelineStep[] = [];
@@ -255,12 +228,7 @@ export async function extractDesign(
   try {
     imgEl = await loadImage(imageSrc);
   } catch {
-    return {
-      success: false,
-      error: "Failed to load image",
-      steps: [],
-      processingTime: 0,
-    };
+    return { success: false, error: "Failed to load image", steps: [], processingTime: 0 };
   }
 
   const src = downscale(imgEl);
@@ -276,190 +244,165 @@ export async function extractDesign(
     onProgress?.(name, progress[0]);
     const t1 = performance.now();
     await fn();
-    steps.push({
-      name,
-      duration: performance.now() - t1,
-      inputDimensions: { w, h },
-    });
+    steps.push({ name, duration: performance.now() - t1, inputDimensions: { w, h } });
     onProgress?.(name, progress[1]);
   };
 
-  // 1. Preprocessing
-  await runStep("Preprocessing", () => {}, [0, 0.1])();
+  // 1. Load & downscale
+  await runStep("Loading image", () => {}, [0, 0.05])();
 
-  // 2. Denoise — proper per-channel blur, preserves color
+  // 2. Denoise
   if (opts.denoise) {
     await runStep("Denoising", () => {
       data = new Uint8ClampedArray(denoiseRGBA(data, w, h, 1));
-    }, [0.1, 0.2])();
+    }, [0.05, 0.15])();
   }
 
-  // 3. Detect background
-  let bgMask: Uint8Array | null = null;
-  let mask: Uint8Array | null = null;
-  let bbox: { x: number; y: number; w: number; h: number } | null = null;
+  // 3. Detect garment
+  let garmentMask: Uint8Array;
+  await runStep("Detecting garment", () => {
+    const result = detectGarment(data, w, h);
+    garmentMask = result.garmentMask;
 
-  await runStep("Detecting design", () => {
-    if (opts.backgroundRemoval) {
-      bgMask = detectBackground(data, w, h, 45);
-      const bgFraction = borderBgFraction(bgMask, w, h);
+    // Count garment vs bg
+    let garmentPx = 0;
+    for (let i = 0; i < w * h; i++) if (garmentMask[i]) garmentPx++;
+    const garmentFrac = garmentPx / (w * h);
+    steps[steps.length - 1].details = `Garment: ${(garmentFrac * 100).toFixed(0)}% of image`;
 
-      // Only use bg detection if >30% of border is background
-      if (bgFraction > 0.3) {
-        // Create foreground mask (inverse of bg)
-        mask = new Uint8Array(w * h);
-        for (let i = 0; i < w * h; i++) mask[i] = bgMask![i] ? 0 : 1;
-        mask = erodeMask(mask, w, h, 1);
-        mask = dilateMask(mask, w, h, 2);
-      } else {
-        // No clear background — treat entire image as design
-        bgMask = null;
-        mask = new Uint8Array(w * h);
-        mask.fill(1);
-      }
-    } else {
-      mask = new Uint8Array(w * h);
-      mask.fill(1);
+    // If garment < 10% or > 95%, the detection probably failed
+    if (garmentFrac < 0.1 || garmentFrac > 0.95) {
+      garmentMask = new Uint8Array(w * h);
+      garmentMask.fill(1); // Keep everything
+      steps[steps.length - 1].details += " (fallback: keeping full image)";
     }
+  }, [0.15, 0.3])();
 
-    bbox = findDesignBoundingBox(mask, w, h);
-    steps[steps.length - 1].details = bbox
-      ? `Found design at (${bbox.x}, ${bbox.y}) ${bbox.w}x${bbox.h}`
-      : "Using full image";
-  }, [0.2, 0.35])();
+  // 4. Find garment bounds
+  let cropQuad: Quad;
+  let cropBBox: { x: number; y: number; w: number; h: number };
 
-  if (!bbox) {
-    // Fallback: use full image
-    bbox = { x: 0, y: 0, w, h };
-  }
-
-  // 4. Edge detection + corner fitting
-  let quad: Quad | null = null;
-
-  if (opts.perspectiveCorrection) {
-    await runStep("Fitting quadrilateral", () => {
-      const gray = rgbaToGrayscale(data, w, h);
-      const blurred = gaussianBlur(gray, w, h, 1.0);
-
-      const margin = 10;
-      const corners = harrisCorners(blurred, w, h, 5, 0.04, 1000);
-      const filtered = corners.filter(
-        (p) =>
-          p.x >= bbox!.x - margin &&
-          p.x <= bbox!.x + bbox!.w + margin &&
-          p.y >= bbox!.y - margin &&
-          p.y <= bbox!.y + bbox!.h + margin
-      );
-
-      quad = fitQuadrilateral(filtered, w, h);
-      if (!quad) {
-        quad = cornersFromBoundingBox(bbox!);
-      }
-      steps[steps.length - 1].details = quad
-        ? `Quad: TL(${Math.round(quad.topLeft.x)},${Math.round(quad.topLeft.y)}) TR(${Math.round(quad.topRight.x)},${Math.round(quad.topRight.y)}) BR(${Math.round(quad.bottomRight.x)},${Math.round(quad.bottomRight.y)}) BL(${Math.round(quad.bottomLeft.x)},${Math.round(quad.bottomLeft.y)})`
-        : "Using bounding box";
-    }, [0.35, 0.45])();
-  }
+  await runStep("Finding design area", () => {
+    const bounds = findGarmentBounds(garmentMask!, w, h);
+    if (!bounds) {
+      cropQuad = { topLeft: { x: 0, y: 0 }, topRight: { x: w, y: 0 }, bottomRight: { x: w, y: h }, bottomLeft: { x: 0, y: h } };
+      cropBBox = { x: 0, y: 0, w, h };
+      steps[steps.length - 1].details = "Using full image";
+    } else {
+      cropQuad = bounds.quad;
+      cropBBox = bounds.bbox;
+      steps[steps.length - 1].details = `Design area: ${cropBBox.w}x${cropBBox.h} at (${cropBBox.x}, ${cropBBox.y})`;
+    }
+  }, [0.3, 0.35])();
 
   // 5. Perspective correction
-  if (opts.perspectiveCorrection && quad) {
+  if (opts.perspectiveCorrection) {
     await runStep("Correcting perspective", () => {
-      const outW = Math.round(
-        (Math.max(
-          quad!.topRight.x - quad!.topLeft.x,
-          quad!.bottomRight.x - quad!.bottomLeft.x
-        ) + Math.max(
-          quad!.bottomLeft.x - quad!.topLeft.x,
-          quad!.bottomRight.x - quad!.topRight.x
-        )) / 2
-      );
-      const outH = Math.round(
-        (Math.max(
-          quad!.bottomLeft.y - quad!.topLeft.y,
-          quad!.bottomRight.y - quad!.topRight.y
-        ) + Math.max(
-          quad!.topRight.y - quad!.topLeft.y,
-          quad!.bottomRight.y - quad!.bottomLeft.y
-        )) / 2
-      );
+      // Use garment bbox as the output dimensions (preserves aspect ratio)
+      const outW = cropBBox!.w;
+      const outH = cropBBox!.h;
 
-      if (outW > 10 && outH > 10) {
-        const warped = warpPerspective(data, w, h, quad!, outW, outH);
+      if (outW > 20 && outH > 20) {
+        const warped = warpPerspective(data, w, h, cropQuad!, outW, outH);
         data = new Uint8ClampedArray(warped.data);
         w = outW;
         h = outH;
 
-        // Re-detect bg on warped
-        if (opts.backgroundRemoval) {
-          bgMask = detectBackground(data, w, h, 45);
-          const bgFrac = borderBgFraction(bgMask, w, h);
-          if (bgFrac > 0.3) {
-            mask = new Uint8Array(w * h);
-            for (let i = 0; i < w * h; i++) mask[i] = bgMask![i] ? 0 : 1;
-            mask = erodeMask(mask, w, h, 1);
-            mask = dilateMask(mask, w, h, 2);
-          } else {
-            bgMask = null;
-            mask = new Uint8Array(w * h);
-            mask.fill(1);
-          }
+        // Also warp the garment mask to match
+        // (use nearest-neighbor for binary mask)
+        const maskCanvas = document.createElement("canvas");
+        maskCanvas.width = w;
+        maskCanvas.height = h;
+        const maskCtx = maskCanvas.getContext("2d")!;
+
+        // Draw mask as grayscale
+        const maskImg = new ImageData(w, h);
+        for (let i = 0; i < w * h; i++) {
+          const v = garmentMask![i] ? 255 : 0;
+          maskImg.data[i * 4] = v;
+          maskImg.data[i * 4 + 1] = v;
+          maskImg.data[i * 4 + 2] = v;
+          maskImg.data[i * 4 + 3] = 255;
         }
+
+        // Create source canvas for mask
+        const srcMaskCanvas = document.createElement("canvas");
+        srcMaskCanvas.width = src!.w;
+        srcMaskCanvas.height = src!.h;
+        const srcMaskCtx = srcMaskCanvas.getContext("2d")!;
+        srcMaskCtx.putImageData(maskImg, 0, 0);
+
+        // We need to warp the mask too — use same quad mapping
+        // Simple approach: just re-detect from the warped image
+        const reDetected = detectGarment(data, w, h);
+        garmentMask = reDetected.garmentMask;
+
+        garmentMask = new Uint8Array(w * h);
+        for (let i = 0; i < w * h; i++) garmentMask[i] = reDetected.garmentMask[i];
       }
-    }, [0.45, 0.55])();
+    }, [0.35, 0.5])();
   }
 
-  // 6. Wrinkle removal — gentle, preserves color
+  // 6. Wrinkle removal
   if (opts.wrinkleRemoval && opts.wrinkleRemoval > 0) {
     await runStep("Removing wrinkles", () => {
       data = new Uint8ClampedArray(removeWrinkles(data, w, h, opts.wrinkleRemoval!));
-    }, [0.55, 0.65])();
+    }, [0.5, 0.6])();
   }
 
-  // 7. Lighting gradient removal — gentle
-  await runStep("Removing lighting gradient", () => {
+  // 7. Lighting gradient removal
+  await runStep("Removing shadows", () => {
     data = new Uint8ClampedArray(removeLightingGradient(data, w, h));
-  }, [0.65, 0.7])();
+  }, [0.6, 0.65])();
 
-  // 8. Color correction — only if enabled, gentle
+  // 8. Color correction
   if (opts.colorCorrection) {
-    await runStep("Correcting colors", () => {
+    await runStep("Enhancing colors", () => {
       data = new Uint8ClampedArray(autoWhiteBalance(data));
       data = new Uint8ClampedArray(autoLevels(data, 0.5));
       data = new Uint8ClampedArray(normalizeSaturation(data, 1.1));
-    }, [0.7, 0.8])();
+    }, [0.65, 0.75])();
   }
 
-  // 9. Generate alpha mask — based on bg detection, not color threshold
-  await runStep("Extracting design", () => {
-    mask = edgeBasedAlpha(data, w, h, bgMask);
-  }, [0.8, 0.88])();
+  // 9. Generate alpha mask from garment detection
+  let alpha: Uint8Array;
+  await runStep("Extracting artwork", () => {
+    alpha = garmentToAlpha(garmentMask!, w, h);
 
-  // 10. Crop
-  let cropRect = { x: 0, y: 0, w, h };
-  await runStep("Cropping", () => {
-    // Only crop if there's actually background to remove
-    if (bgMask) {
-      const cropped = autoCrop(data, mask!, w, h, 4);
-      if (cropped && cropped.w > 10 && cropped.h > 10) {
-        data = new Uint8ClampedArray(cropped.data);
-        mask = new Uint8Array(cropped.mask);
-        w = cropped.w;
-        h = cropped.h;
-        cropRect = { x: cropped.x, y: cropped.y, w: cropped.w, h: cropped.h };
-      }
+    // Verify alpha has non-zero content
+    let opaquePx = 0;
+    for (let i = 0; i < w * h; i++) if (alpha![i] > 128) opaquePx++;
+    const opaqueFrac = opaquePx / (w * h);
+
+    if (opaqueFrac < 0.05) {
+      // Alpha is mostly transparent — the garment detection may have failed
+      // Fallback: keep everything opaque
+      alpha = new Uint8Array(w * h);
+      alpha.fill(255);
+      steps[steps.length - 1].details = "Fallback: keeping full image (no background removal)";
+    } else {
+      steps[steps.length - 1].details = `Artwork: ${(opaqueFrac * 100).toFixed(0)}% visible`;
     }
-  }, [0.88, 0.92])();
+  }, [0.75, 0.85])();
 
-  // 11. Render output
+  // 10. Flatten onto white background for display output
   let outputDataURL: string;
   let outputMaskDataURL: string | undefined;
 
   await runStep("Rendering output", () => {
-    // Flatten to white background for display
-    const flattened = flattenToWhiteBackground(data, mask!, w, h);
-    outputDataURL = imageBufferToDataURL(flattened, w, h, opts.outputFormat, opts.outputQuality);
+    // Composite: design * alpha + white * (1-alpha)
+    const flat = new Uint8ClampedArray(w * h * 4);
+    for (let i = 0; i < w * h; i++) {
+      const a = alpha![i] / 255;
+      const oi = i * 4;
+      flat[oi] = clampByte(data[oi] * a + 255 * (1 - a));
+      flat[oi + 1] = clampByte(data[oi + 1] * a + 255 * (1 - a));
+      flat[oi + 2] = clampByte(data[oi + 2] * a + 255 * (1 - a));
+      flat[oi + 3] = 255;
+    }
+    outputDataURL = imageBufferToDataURL(flat, w, h, opts.outputFormat, opts.outputQuality);
 
-    // Render with transparency for download
+    // Also make a transparent version
     const canvas = document.createElement("canvas");
     canvas.width = w;
     canvas.height = h;
@@ -467,25 +410,23 @@ export async function extractDesign(
     const imgData = new ImageData(new Uint8ClampedArray(data), w, h);
     ctx.putImageData(imgData, 0, 0);
 
-    if (mask) {
-      const alphaCanvas = document.createElement("canvas");
-      alphaCanvas.width = w;
-      alphaCanvas.height = h;
-      const alphaCtx = alphaCanvas.getContext("2d")!;
-      const alphaImg = new ImageData(w, h);
-      for (let i = 0; i < w * h; i++) {
-        alphaImg.data[i * 4] = mask![i];
-        alphaImg.data[i * 4 + 1] = mask![i];
-        alphaImg.data[i * 4 + 2] = mask![i];
-        alphaImg.data[i * 4 + 3] = 255;
-      }
-      alphaCtx.putImageData(alphaImg, 0, 0);
-      ctx.globalCompositeOperation = "destination-in";
-      ctx.drawImage(alphaCanvas, 0, 0);
+    // Apply alpha
+    const alphaCanvas = document.createElement("canvas");
+    alphaCanvas.width = w;
+    alphaCanvas.height = h;
+    const alphaCtx = alphaCanvas.getContext("2d")!;
+    const alphaImg = new ImageData(w, h);
+    for (let i = 0; i < w * h; i++) {
+      alphaImg.data[i * 4] = alpha![i];
+      alphaImg.data[i * 4 + 1] = alpha![i];
+      alphaImg.data[i * 4 + 2] = alpha![i];
+      alphaImg.data[i * 4 + 3] = 255;
     }
-
+    alphaCtx.putImageData(alphaImg, 0, 0);
+    ctx.globalCompositeOperation = "destination-in";
+    ctx.drawImage(alphaCanvas, 0, 0);
     outputMaskDataURL = canvas.toDataURL("image/png");
-  }, [0.92, 1.0])();
+  }, [0.85, 1.0])();
 
   return {
     success: true,
@@ -497,7 +438,64 @@ export async function extractDesign(
       input: { w: imgEl.naturalWidth, h: imgEl.naturalHeight },
       output: { w, h },
     },
-    cropRegion: cropRect,
-    maskData: mask || undefined,
+    maskData: alpha!,
   };
+}
+
+// ============================================================
+// Denoise helper
+// ============================================================
+function denoiseRGBA(
+  data: Uint8ClampedArray,
+  w: number,
+  h: number,
+  radius: number
+): Uint8ClampedArray {
+  const out = new Uint8ClampedArray(data);
+  const kernel: number[] = [];
+  let sum = 0;
+  for (let i = -radius; i <= radius; i++) {
+    const v = Math.exp(-(i * i) / (2 * radius * radius));
+    kernel.push(v);
+    sum += v;
+  }
+  for (let i = 0; i < kernel.length; i++) kernel[i] /= sum;
+
+  const temp = new Float32Array(w * h * 4);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let r = 0, g = 0, b = 0;
+      for (let k = -radius; k <= radius; k++) {
+        const sx = Math.min(Math.max(x + k, 0), w - 1);
+        const idx = (y * w + sx) * 4;
+        const wt = kernel[k + radius];
+        r += data[idx] * wt;
+        g += data[idx + 1] * wt;
+        b += data[idx + 2] * wt;
+      }
+      const oi = (y * w + x) * 4;
+      temp[oi] = r;
+      temp[oi + 1] = g;
+      temp[oi + 2] = b;
+    }
+  }
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let r = 0, g = 0, b = 0;
+      for (let k = -radius; k <= radius; k++) {
+        const sy = Math.min(Math.max(y + k, 0), h - 1);
+        const idx = (sy * w + x) * 4;
+        const wt = kernel[k + radius];
+        r += temp[idx] * wt;
+        g += temp[idx + 1] * wt;
+        b += temp[idx + 2] * wt;
+      }
+      const oi = (y * w + x) * 4;
+      out[oi] = clampByte(r);
+      out[oi + 1] = clampByte(g);
+      out[oi + 2] = clampByte(b);
+      out[oi + 3] = data[oi + 3];
+    }
+  }
+  return out;
 }

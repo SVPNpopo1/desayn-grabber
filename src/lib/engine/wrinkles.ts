@@ -24,7 +24,7 @@ export function removeWrinkles(
   const sigmaSpace = 3;
   const sigmaRange = 30;
 
-  for (let iter = 0; iter < 2; iter++) {
+  for (let iter = 0; iter < 1; iter++) {
     const prev = new Float32Array(smoothed);
     for (let y = radius; y < h - radius; y++) {
       for (let x = radius; x < w - radius; x++) {

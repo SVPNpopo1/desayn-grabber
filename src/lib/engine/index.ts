@@ -371,7 +371,7 @@ export async function extractDesign(
       const blurred = gaussianBlur(gray, w, h, 1.0);
 
       const margin = 10;
-      const corners = harrisCorners(blurred, w, h, 7, 0.04, 500);
+      const corners = harrisCorners(blurred, w, h, 5, 0.04, 1000);
       const filtered = corners.filter(
         (p) =>
           p.x >= bbox!.x - margin &&

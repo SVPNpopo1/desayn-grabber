@@ -172,48 +172,33 @@ export function fitQuadrilateral(
 ): Quad | null {
   if (corners.length < 4) return null;
 
-  // Find the 4 extreme corners: top-left, top-right, bottom-right, bottom-left
-  // Using angle from centroid approach
-  let cx = 0, cy = 0;
-  for (const p of corners) { cx += p.x; cy += p.y; }
-  cx /= corners.length;
-  cy /= corners.length;
+  // O(n) approach: find 4 extreme points (top-left, top-right, bottom-right, bottom-left)
+  // by finding the points that maximize/minimize x+y and x-y
+  let tl = corners[0], tr = corners[0], br = corners[0], bl = corners[0];
+  let maxSum = -Infinity, minSum = Infinity, maxDiff = -Infinity, minDiff = Infinity;
 
-  // Sort corners by angle from center
-  const sorted = [...corners].sort((a, b) => {
-    const aa = Math.atan2(a.y - cy, a.x - cx);
-    const ab = Math.atan2(b.y - cy, b.x - cx);
-    return aa - ab;
-  });
-
-  // Find the 4 most extreme points in each quadrant
-  let best: Quad | null = null;
-  let bestArea = 0;
-
-  // Try all combinations of 4 corners
-  for (let i = 0; i < sorted.length; i++) {
-    for (let j = i + 1; j < sorted.length; j++) {
-      for (let k = j + 1; k < sorted.length; k++) {
-        for (let l = k + 1; l < sorted.length; l++) {
-          const pts = [sorted[i], sorted[j], sorted[k], sorted[l]];
-          const q = classifyCorners(pts);
-          if (!q) continue;
-          const area = quadArea(q);
-          if (area > bestArea) {
-            bestArea = area;
-            best = q;
-          }
-        }
-      }
-    }
+  for (const p of corners) {
+    const sum = p.x + p.y;
+    const diff = p.x - p.y;
+    if (sum > maxSum) { maxSum = sum; br = p; }
+    if (sum < minSum) { minSum = sum; tl = p; }
+    if (diff > maxDiff) { maxDiff = diff; tr = p; }
+    if (diff < minDiff) { minDiff = diff; bl = p; }
   }
 
-  // Fallback: if no good quad found, use convex hull extremes
-  if (!best) {
-    best = fitBoxQuad(corners, imgW, imgH);
+  // If any two corners are the same point, fallback to bounding box
+  const pts = [tl, tr, br, bl];
+  const unique = new Set(pts.map(p => `${p.x},${p.y}`));
+  if (unique.size < 4) {
+    return cornersFromBoundingBox({
+      x: Math.min(...corners.map(p => p.x)),
+      y: Math.min(...corners.map(p => p.y)),
+      w: Math.max(...corners.map(p => p.x)) - Math.min(...corners.map(p => p.x)),
+      h: Math.max(...corners.map(p => p.y)) - Math.min(...corners.map(p => p.y)),
+    });
   }
 
-  return best;
+  return { topLeft: tl, topRight: tr, bottomRight: br, bottomLeft: bl };
 }
 
 function classifyCorners(pts: Point[]): Quad | null {

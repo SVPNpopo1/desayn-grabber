@@ -1,33 +1,30 @@
 import { gaussianBlur } from "./preprocess";
 
+function clampByte(v: number): number {
+  return v < 0 ? 0 : v > 255 ? 255 : Math.round(v);
+}
+
 export function removeWrinkles(
   data: Uint8ClampedArray,
   w: number,
   h: number,
-  strength: number = 0.7
+  strength: number = 0.5
 ): Uint8ClampedArray {
   const out = new Uint8ClampedArray(data);
 
-  // Extract channels
-  const r = new Float32Array(w * h);
-  const g = new Float32Array(w * h);
-  const b = new Float32Array(w * h);
+  // Extract luminance
   const lum = new Float32Array(w * h);
-
   for (let i = 0; i < w * h; i++) {
-    r[i] = data[i * 4];
-    g[i] = data[i * 4 + 1];
-    b[i] = data[i * 4 + 2];
-    lum[i] = 0.299 * r[i] + 0.587 * g[i] + 0.114 * b[i];
+    lum[i] = 0.299 * data[i * 4] + 0.587 * data[i * 4 + 1] + 0.114 * data[i * 4 + 2];
   }
 
-  // Edge-preserving smoothing using iterative bilateral-like filter
+  // Edge-preserving smoothing on luminance only
   const smoothed = new Float32Array(lum);
-  const radius = 3;
-  const sigmaSpace = 4;
-  const sigmaRange = 25;
+  const radius = 2;
+  const sigmaSpace = 3;
+  const sigmaRange = 30;
 
-  for (let iter = 0; iter < 3; iter++) {
+  for (let iter = 0; iter < 2; iter++) {
     const prev = new Float32Array(smoothed);
     for (let y = radius; y < h - radius; y++) {
       for (let x = radius; x < w - radius; x++) {
@@ -50,7 +47,7 @@ export function removeWrinkles(
     }
   }
 
-  // Compute edge map from original
+  // Compute edge strength
   const edges = new Float32Array(w * h);
   for (let y = 1; y < h - 1; y++) {
     for (let x = 1; x < w - 1; x++) {
@@ -60,7 +57,6 @@ export function removeWrinkles(
     }
   }
 
-  // Normalize edges
   let maxEdge = 0;
   for (let i = 0; i < w * h; i++) {
     if (edges[i] > maxEdge) maxEdge = edges[i];
@@ -69,18 +65,18 @@ export function removeWrinkles(
     for (let i = 0; i < w * h; i++) edges[i] /= maxEdge;
   }
 
-  // Blend: use smoothed in low-edge areas, original in high-edge areas
+  // Apply: use ADDITIVE luminance delta (preserves hue/saturation)
+  // ratio-based destroys color; additive only changes brightness
   for (let i = 0; i < w * h; i++) {
     const edgeWeight = Math.pow(edges[i], 0.5);
     const blendFactor = strength * (1 - edgeWeight);
 
-    const newLum = lum[i] * (1 - blendFactor) + smoothed[i] * blendFactor;
+    const delta = (smoothed[i] - lum[i]) * blendFactor;
 
-    // Apply luminance change to RGB proportionally
-    const ratio = newLum / Math.max(lum[i], 1);
-    out[i * 4] = Math.min(255, Math.max(0, Math.round(r[i] * ratio)));
-    out[i * 4 + 1] = Math.min(255, Math.max(0, Math.round(g[i] * ratio)));
-    out[i * 4 + 2] = Math.min(255, Math.max(0, Math.round(b[i] * ratio)));
+    const oi = i * 4;
+    out[oi] = clampByte(data[oi] + delta);
+    out[oi + 1] = clampByte(data[oi + 1] + delta);
+    out[oi + 2] = clampByte(data[oi + 2] + delta);
   }
 
   return out;
@@ -105,7 +101,6 @@ export function removeLightingGradient(
   const meanLum = totalLum / (w * h);
 
   // Estimate gradient using least-squares plane fit
-  // z = a*x + b*y + c
   let sx = 0, sy = 0, sz = 0, sxx = 0, syy = 0, sxy = 0, sxz = 0, syz = 0;
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
@@ -126,18 +121,19 @@ export function removeLightingGradient(
   const b = (n * (sxz * syy - syz * sxy) - sx * (sz * syy - sy * syz) + sy * (sz * sxy - sy * sxz)) / det;
   const c = (n * (sxx * syz - sxy * sxz) - sx * (sx * syz - sy * sxz) + sy * (sx * sxy - sy * sxx)) / det;
 
-  // Subtract gradient from each channel
+  // Compute gradient correction, blend at 60% strength
+  const strength = 0.6;
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const xf = x / w;
       const yf = y / h;
       const gradientLum = a * xf + b * yf + c;
-      const correction = meanLum - gradientLum;
+      const correction = (meanLum - gradientLum) * strength;
 
       const i = (y * w + x) * 4;
-      out[i] = Math.min(255, Math.max(0, Math.round(data[i] + correction)));
-      out[i + 1] = Math.min(255, Math.max(0, Math.round(data[i + 1] + correction)));
-      out[i + 2] = Math.min(255, Math.max(0, Math.round(data[i + 2] + correction)));
+      out[i] = clampByte(data[i] + correction);
+      out[i + 1] = clampByte(data[i + 1] + correction);
+      out[i + 2] = clampByte(data[i + 2] + correction);
     }
   }
 

@@ -7,8 +7,9 @@ import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { useRouter } from "next/navigation";
-import { useAppStore, setGlobalData, getGlobalData } from "@/lib/store";
-import { extractDesign, generateAnalysisOverlay } from "@/lib/extractor";
+import { useAppStore, setGlobalData } from "@/lib/store";
+import { extractDesign } from "@/lib/extractor";
+import type { PipelineResult } from "@/lib/engine/types";
 
 export function HeroSection() {
   const [isDragging, setIsDragging] = useState(false);
@@ -39,32 +40,37 @@ export function HeroSection() {
     if (!preview) return;
     setProgress("Analyzing design...");
     try {
-      await new Promise((r) => setTimeout(r, 300));
+      const result: PipelineResult = await extractDesign(
+        preview,
+        {
+          colorCorrection: enhanceAI,
+          wrinkleRemoval: 0.7,
+          perspectiveCorrection: true,
+          backgroundRemoval: true,
+        },
+        (step, pct) => {
+          setProgress(`${step}...`);
+        }
+      );
 
-      setProgress("Detecting patterns...");
-      const { overlayDataUrl } = await generateAnalysisOverlay(preview, { margin: 5 });
-      await new Promise((r) => setTimeout(r, 400));
+      if (!result.success) {
+        setProgress(result.error || "Extraction failed");
+        setTimeout(() => setProgress(""), 3000);
+        return;
+      }
 
-      setProgress("Extracting artwork...");
-      const extracted = await extractDesign(preview, {
-        margin: 5,
-        enhance: enhanceAI,
-        outputWidth: 800,
-      });
-      await new Promise((r) => setTimeout(r, 200));
-
-      setProgress("Reconstructing...");
       setGlobalData({
         uploadedImage: preview,
         uploadedFileName: fileName,
-        extractedDesign: extracted,
-        analysisOverlay: overlayDataUrl,
+        extractedDesign: result.outputImage!,
+        pipelineResult: result,
       });
 
       router.push("/project/result");
     } catch (err) {
       console.error("Extraction failed:", err);
       setProgress("Failed - try a different image");
+      setTimeout(() => setProgress(""), 3000);
     } finally {
       setProgress("");
     }

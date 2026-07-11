@@ -6,11 +6,11 @@ interface StoredData {
   uploadedImage: string | null;
   uploadedFileName: string | null;
   extractedDesign: string | null;
-  analysisOverlay: string | null;
+  pipelineResult: any | null;
 }
 
 const KEY = "desayn_data";
-const EMPTY: StoredData = { uploadedImage: null, uploadedFileName: null, extractedDesign: null, analysisOverlay: null };
+const EMPTY: StoredData = { uploadedImage: null, uploadedFileName: null, extractedDesign: null, pipelineResult: null };
 
 export function getGlobalData(): StoredData {
   if (typeof window === "undefined") return EMPTY;
@@ -29,7 +29,7 @@ export function getGlobalData(): StoredData {
         uploadedImage: img || null,
         uploadedFileName: m.uploadedFileName ?? null,
         extractedDesign: svg || null,
-        analysisOverlay: m.analysisOverlay ?? null,
+        pipelineResult: m.pipelineResult ?? null,
       };
     }
   } catch (e) {
@@ -63,7 +63,7 @@ export function setGlobalData(data: Partial<StoredData>) {
     if (merged.extractedDesign) sessionStorage.setItem(KEY + "_svg", merged.extractedDesign);
     sessionStorage.setItem(KEY + "_meta", JSON.stringify({
       uploadedFileName: merged.uploadedFileName,
-      analysisOverlay: merged.analysisOverlay,
+      pipelineResult: merged.pipelineResult,
     }));
     sessionStorage.setItem(KEY + "_split", "1");
     // Remove combined key

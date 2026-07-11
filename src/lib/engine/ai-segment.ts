@@ -1,113 +1,108 @@
 /**
- * AI segmentation module.
- *
- * Uses MediaPipe selfie_segmenter loaded from CDN at runtime.
- * Falls back gracefully to null (triggering CV fallback in the pipeline).
+ * AI segmentation via a Web Worker that loads MediaPipe from CDN.
+ * The worker runs independently of the bundler — no Turbopack issues.
+ * Falls back to returning null on any failure (triggering CV fallback in pipeline).
  */
 
-const WASM_CDN = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm";
-const MODEL_URL =
-  "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite";
+let worker: Worker | null = null;
+let initPromise: boolean | null = null; // null = not started, true/false = resolved
+let initWaiters: ((ok: boolean) => void)[] = [];
 
-let loaderPromise: Promise<any> | null = null;
-let segmenterPromise: Promise<any> | null = null;
+let nextId = 0;
+const pending = new Map<number, { resolve: (m: Uint8Array | null) => void; timer: ReturnType<typeof setTimeout> }>();
 
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  return Promise.race([
-    promise,
-    new Promise<T>((_, reject) =>
-      setTimeout(() => reject(new Error(`Timed out after ${ms}ms`)), ms)
-    ),
-  ]);
-}
+function getWorker(): Worker {
+  if (worker) return worker;
 
-async function loadVisionTasks(): Promise<any> {
-  if (loaderPromise) return loaderPromise;
+  worker = new Worker("/mp-worker.js");
 
-  loaderPromise = (async () => {
-    // Load MediaPipe vision bundle into a global via dynamic script injection
-    // The bundle registers itself on window when loaded as a classic script
-    const bundleUrl =
-      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/vision_bundle.js";
+  worker.onmessage = (e: MessageEvent) => {
+    const msg = e.data;
 
-    await new Promise<void>((resolve, reject) => {
-      const existing = document.getElementById("mp-vision-bundle");
-      if (existing) { resolve(); return; }
-      const s = document.createElement("script");
-      s.id = "mp-vision-bundle";
-      s.src = bundleUrl;
-      s.crossOrigin = "anonymous";
-      s.onload = () => resolve();
-      s.onerror = () => reject(new Error("Failed to load MediaPipe vision bundle"));
-      document.head.appendChild(s);
-    });
-
-    // The UMD bundle exposes everything under the global scope
-    // Try common global names
-    const w = window as any;
-    const vision = w.vision || w.Vision || w.mediapipe || w;
-    if (!vision?.ImageSegmenter) {
-      throw new Error("MediaPipe ImageSegmenter not found on window");
+    if (msg.type === "init") {
+      initPromise = msg.success;
+      for (const fn of initWaiters) fn(msg.success);
+      initWaiters = [];
+      if (!msg.success) {
+        console.warn("[ai-segment] Worker init failed:", msg.error);
+      }
+      return;
     }
-    return vision;
-  })();
 
-  return loaderPromise;
+    if (msg.type === "segment") {
+      const p = pending.get(msg.id);
+      if (!p) return;
+      pending.delete(msg.id);
+      clearTimeout(p.timer);
+      p.resolve(msg.mask);
+    }
+  };
+
+  worker.onerror = (err) => {
+    console.warn("[ai-segment] Worker error:", err);
+    initPromise = false;
+    for (const fn of initWaiters) fn(false);
+    initWaiters = [];
+    // Kill and recreate on next attempt
+    worker?.terminate();
+    worker = null;
+  };
+
+  return worker;
 }
 
 /**
- * AI segmentation using MediaPipe selfie_segmenter.
+ * Ensure the worker's MediaPipe segmenter is loaded.
+ * Returns true if ready, false on failure. Times out after ms.
+ */
+async function ensureInit(ms: number): Promise<boolean> {
+  if (initPromise === true) return true;
+  if (initPromise === false) return false;
+
+  const w = getWorker();
+  // Kick off init (idempotent on worker side)
+  w.postMessage({ type: "init" });
+
+  return new Promise<boolean>((resolve) => {
+    const done = (ok: boolean) => { resolve(ok); };
+    initWaiters.push(done);
+    setTimeout(() => {
+      // Remove ourselves if still waiting
+      const idx = initWaiters.indexOf(done);
+      if (idx >= 0) initWaiters.splice(idx, 1);
+      resolve(false);
+    }, ms);
+  });
+}
+
+/**
+ * AI segmentation using MediaPipe selfie_segmenter via Web Worker.
  * Returns Uint8Array mask: 1 = foreground (person/garment), 0 = background.
- * Returns null on any failure (model load, timeout, segmentation error).
+ * Returns null on any failure (model load timeout, segmentation error).
  */
 export async function aiSegmentForeground(
   imageData: ImageData
 ): Promise<Uint8Array | null> {
-  let segmenter: any;
+  const ready = await ensureInit(12000);
+  if (!ready || !worker) return null;
 
-  try {
-    if (!segmenterPromise) {
-      segmenterPromise = (async () => {
-        const vision = await loadVisionTasks();
-        const filesetResolver = await vision.FilesetResolver.forVisionTasks(WASM_CDN);
-        return vision.ImageSegmenter.createFromOptions(filesetResolver, {
-          baseOptions: { modelAssetPath: MODEL_URL, delegate: "GPU" },
-          runningMode: "IMAGE",
-          outputConfidenceMasks: true,
-          outputCategoryMask: false,
-        });
-      })();
-    }
-    segmenter = await withTimeout(segmenterPromise, 8000);
-  } catch (err) {
-    console.warn("[ai-segment] MediaPipe init failed, falling back to CV:", err);
-    loaderPromise = null;
-    segmenterPromise = null;
-    return null;
-  }
+  const id = nextId++;
+  const { width, height } = imageData;
 
-  try {
-    const result = segmenter.segment(imageData);
-    const confMask = result.confidenceMasks?.[0];
-    if (!confMask) {
-      result.close();
-      return null;
-    }
+  return new Promise<Uint8Array | null>((resolve) => {
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      resolve(null);
+    }, 8000);
 
-    const raw = confMask.getAsFloat32Array();
-    const mask = new Uint8Array(imageData.width * imageData.height);
+    pending.set(id, { resolve, timer });
 
-    for (let i = 0; i < mask.length; i++) {
-      mask[i] = raw[i] > 0.5 ? 1 : 0;
-    }
-
-    confMask.close();
-    result.close();
-    return mask;
-  } catch (err) {
-    console.warn("[ai-segment] Segmentation failed:", err);
-    return null;
-  }
+    // Transfer pixel buffer to worker (detaches from main thread)
+    worker!.postMessage(
+      { type: "segment", id, pixels: imageData.data, width, height },
+      [imageData.data.buffer]
+    );
+  });
 }
 
 export function imageToImageData(img: HTMLImageElement): ImageData {

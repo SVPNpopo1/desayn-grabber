@@ -301,7 +301,6 @@ export async function extractDesign(
   // 5. Perspective correction
   if (opts.perspectiveCorrection) {
     await runStep("Correcting perspective", () => {
-      // Use garment bbox as the output dimensions (preserves aspect ratio)
       const outW = cropBBox!.w;
       const outH = cropBBox!.h;
 
@@ -311,37 +310,11 @@ export async function extractDesign(
         w = outW;
         h = outH;
 
-        // Also warp the garment mask to match
-        // (use nearest-neighbor for binary mask)
-        const maskCanvas = document.createElement("canvas");
-        maskCanvas.width = w;
-        maskCanvas.height = h;
-        const maskCtx = maskCanvas.getContext("2d")!;
-
-        // Draw mask as grayscale
-        const maskImg = new ImageData(w, h);
-        for (let i = 0; i < w * h; i++) {
-          const v = garmentMask![i] ? 255 : 0;
-          maskImg.data[i * 4] = v;
-          maskImg.data[i * 4 + 1] = v;
-          maskImg.data[i * 4 + 2] = v;
-          maskImg.data[i * 4 + 3] = 255;
-        }
-
-        // Create source canvas for mask
-        const srcMaskCanvas = document.createElement("canvas");
-        srcMaskCanvas.width = src!.w;
-        srcMaskCanvas.height = src!.h;
-        const srcMaskCtx = srcMaskCanvas.getContext("2d")!;
-        srcMaskCtx.putImageData(maskImg, 0, 0);
-
-        // We need to warp the mask too — use same quad mapping
-        // Simple approach: just re-detect from the warped image
-        const reDetected = detectGarment(data, w, h);
-        garmentMask = reDetected.garmentMask;
-
+        // After warping to the garment bounding box, the entire cropped
+        // region IS the garment. Don't re-detect — it would invert the
+        // mask because edges are now garment pixels, not background.
         garmentMask = new Uint8Array(w * h);
-        for (let i = 0; i < w * h; i++) garmentMask[i] = reDetected.garmentMask[i];
+        garmentMask.fill(1);
       }
     }, [0.35, 0.5])();
   }
